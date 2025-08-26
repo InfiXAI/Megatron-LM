@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
+from megatron.core.fusions.fused_blockwise_swiglu import fwd_pertoken_quant_swiglu, bwd_pertoken_dequant
 
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
 
@@ -160,7 +161,16 @@ class SwiGLUFunction(torch.autograd.Function):
         Returns:
             torch.Tensor: Result of applying SwiGLU activation.
         """
-        input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        if fp8_input_store:
+            input_for_backward, input_scale, input_swiglu = fwd_pertoken_quant_swiglu(input)
+            ctx.save_for_backward(input_for_backward, input_scale)
+            if cpu_offload_input:
+                input_for_backward.activation_offloading = True
+                input_scale.activation_offloading = True
+            ctx.ori_input_dtype = input.dtype
+            ctx.fp8_input_store = fp8_input_store
+            return input_swiglu
+        # input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
         if cpu_offload_input:
             input_for_backward.activation_offloading = True
         ctx.save_for_backward(input_for_backward)
@@ -182,8 +192,14 @@ class SwiGLUFunction(torch.autograd.Function):
                 - Gradient with respect to the input tensor
                 - None for fp8_input_store parameter
         """
+        if ctx.fp8_input_store:
+            input_for_backward, input_scale = ctx.saved_tensors
+            input = bwd_pertoken_dequant(input_for_backward, input_scale, ctx.ori_input_dtype)
+            tmp = swiglu_back(grad_output, input)
+            return tmp, None, None
+
         input = ctx.saved_tensors[0]
-        input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
+        # input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
         tmp = swiglu_back(grad_output, input)
         return tmp, None, None
 
