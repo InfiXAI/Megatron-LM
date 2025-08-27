@@ -86,13 +86,13 @@ def _fwd_pertoken_quant_swiglu(
 
 def fwd_pertoken_quant_swiglu(x: torch.Tensor, block_size=None) -> Tuple[torch.Tensor, torch.Tensor]:
     M, N = x.shape
-    BLOCK_M, BLOCK_N = 1, N // 2
+    BLOCK_M, BLOCK_N = 1, 128
     if block_size:
         BLOCK_M, BLOCK_N = block_size[0], block_size[1]
     y_fp8 = torch.empty(M, N, device=x.device, dtype=torch.float8_e4m3fn)
     s = torch.empty(ceil_div(M, BLOCK_M), ceil_div(N, BLOCK_N), dtype=torch.float32, device=x.device)
     y = torch.empty(M, N // 2, device=x.device, dtype=x.dtype)
-    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"] * 2))
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N // 2, meta["BLOCK_N"]))
     if x.is_contiguous():
         kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "num_warps": 8, "num_stages": 2}
     else:
@@ -143,9 +143,9 @@ def _bwd_pertoken_dequant(
 
 def bwd_pertoken_dequant(x: torch.Tensor, x_s: torch.Tensor, dtype) -> Tuple[torch.Tensor, torch.Tensor]:
     M, N = x.shape
-    BLOCK_M, BLOCK_N = 1, N // 2
+    BLOCK_M, BLOCK_N = 1, 128
     y = torch.empty(M, N, device=x.device, dtype=dtype)
-    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"] * 2))
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N // 2, meta["BLOCK_N"]))
     if x.is_contiguous():
         kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "num_warps": 8, "num_stages": 2}
     else:
