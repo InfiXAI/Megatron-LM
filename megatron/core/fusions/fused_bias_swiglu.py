@@ -162,10 +162,11 @@ class SwiGLUFunction(torch.autograd.Function):
             torch.Tensor: Result of applying SwiGLU activation.
         """
         if fp8_input_store:
-            input_max = input.max()
+            input_float = input.to(torch.float)
+            input_max = input_float.max()
             input_scale = input_max / torch.finfo(torch.float8_e4m3fn).max
             input_inv = 1 / input_scale
-            input_for_backward = (input * input_inv).to(torch.float8_e4m3fn)
+            input_for_backward = (input_float * input_inv).to(torch.float8_e4m3fn)
 
             ctx.input_scale = input_scale
 
@@ -197,7 +198,7 @@ class SwiGLUFunction(torch.autograd.Function):
         if ctx.fp8_input_store:
             input_for_backward = ctx.saved_tensors[0]
             input_scale = ctx.input_scale
-            input = input_for_backward.to(ctx.ori_input_dtype) * input_scale
+            input = (input_for_backward.to(torch.float) * input_scale).to(input_scale)
         else:
             input = ctx.saved_tensors[0]
         # input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
