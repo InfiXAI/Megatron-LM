@@ -162,15 +162,17 @@ class SwiGLUFunction(torch.autograd.Function):
             torch.Tensor: Result of applying SwiGLU activation.
         """
         if fp8_input_store:
-            input_for_backward, input_scale, input_swiglu = fwd_pertoken_quant_swiglu(input)
-            ctx.save_for_backward(input_for_backward, input_scale)
-            if cpu_offload_input:
-                input_for_backward.activation_offloading = True
-                input_scale.activation_offloading = True
-            ctx.ori_input_dtype = input.dtype
-            ctx.fp8_input_store = fp8_input_store
-            return input_swiglu
-        input_for_backward = input
+            input_max = input.max()
+            input_scale = input_max / torch.finfo(torch.float8_e4m3fn).max
+            input_inv = 1 / input_scale
+            input_for_backward = (input * input_inv).to(torch.float8_e4m3fn)
+
+            ctx.input_scale = input_scale
+
+            input = input_for_backward.to(input.dtype) * input_scale
+        else:
+
+            input_for_backward = input
         if cpu_offload_input:
             input_for_backward.activation_offloading = True
         ctx.save_for_backward(input_for_backward)
@@ -193,12 +195,11 @@ class SwiGLUFunction(torch.autograd.Function):
                 - None for fp8_input_store parameter
         """
         if ctx.fp8_input_store:
-            input_for_backward, input_scale = ctx.saved_tensors
-            input = bwd_pertoken_dequant(input_for_backward, input_scale, ctx.ori_input_dtype)
-            tmp = swiglu_back(grad_output, input)
-            return tmp, None, None
-
-        input = ctx.saved_tensors[0]
+            input_for_backward = ctx.saved_tensors[0]
+            input_scale = ctx.input_scale
+            input = input_for_backward.to(ctx.ori_input_dtype) * input_scale
+        else:
+            input = ctx.saved_tensors[0]
         # input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
         tmp = swiglu_back(grad_output, input)
         return tmp, None, None

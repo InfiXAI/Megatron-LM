@@ -132,8 +132,8 @@ def _bwd_pertoken_dequant(
     x_1 = tl.load(X_fp8 + off_m[:, None] * stride_xm + off_n_1[None, :] * stride_xn, mask=mask_1, other=0.0).to(tl.float32)
     x_2 = tl.load(X_fp8 + off_m[:, None] * stride_xm + off_n_2[None, :] * stride_xn, mask=mask_2, other=0.0).to(tl.float32)
 
-    x_s_1 = tl.load(X_S + pid_m * stride_xsm + pid_n * stride_xsn)
-    x_s_2 = tl.load(X_S + pid_m * stride_xsm + (pid_n + N // BLOCK_N // 2) * stride_xsn)
+    x_s_1 = tl.load(X_S + off_m[:, None] * stride_xsm + pid_n[None, :] * stride_xsn)
+    x_s_2 = tl.load(X_S + off_m[:, None] * stride_xsm + (pid_n + N // BLOCK_N // 2)[None, :] * stride_xsn)
 
     y_1 = x_1 * x_s_1
     y_2 = x_2 * x_s_2
