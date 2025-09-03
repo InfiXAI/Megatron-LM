@@ -101,7 +101,7 @@ class TestFP8:
             save(get_state_dict(4), ckpt_dir, save_strategy)
 
             Utils.destroy_model_parallel()
-            Utilsto.initialize_model_parallel(*dest_tp_pp)
+            Utils.initialize_model_parallel(*dest_tp_pp)
 
             if use_fpsl:
                 load_strategy = get_default_load_sharded_strategy(ckpt_dir)
@@ -115,8 +115,3 @@ class TestFP8:
             assert torch.all(loaded_state_dict['a'] == 4)
             assert torch.all(loaded_state_dict['b'] == 4)
         Utils.destroy_model_parallel()
-
-
-if __name__ == '__main__':
-    t = TestFP8()
-    t.test_fp8_save_load(None,False, (2, 4), (2, 4), None)
