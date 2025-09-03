@@ -259,3 +259,10 @@ class TestFP8Param:
             "num_layers_at_end_in_bf16": 1,
         }
         self.run_test(tp_size=tp_size, recipe="blockwise", **kwargs)
+
+
+if __name__ == '__main__':
+    test = TestFP8Param()
+    test.setup_method()
+    test.run_test(4, 'blockwise')
+    test.teardown_method()
