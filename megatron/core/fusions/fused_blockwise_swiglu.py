@@ -86,13 +86,13 @@ def _fwd_pertoken_quant_swiglu(
 
 def fwd_pertoken_quant_swiglu(x: torch.Tensor, block_size=None) -> Tuple[torch.Tensor, torch.Tensor]:
     M, N = x.shape
-    BLOCK_M, BLOCK_N = 1, N // 2
+    BLOCK_M, BLOCK_N = 1, 128
     if block_size:
         BLOCK_M, BLOCK_N = block_size[0], block_size[1]
     y_fp8 = torch.empty(M, N, device=x.device, dtype=torch.float8_e4m3fn)
     s = torch.empty(ceil_div(M, BLOCK_M), ceil_div(N, BLOCK_N), dtype=torch.float32, device=x.device)
     y = torch.empty(M, N // 2, device=x.device, dtype=x.dtype)
-    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"] * 2))
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N // 2, meta["BLOCK_N"]))
     if x.is_contiguous():
         kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "num_warps": 8, "num_stages": 2}
     else:
@@ -132,8 +132,8 @@ def _bwd_pertoken_dequant(
     x_1 = tl.load(X_fp8 + off_m[:, None] * stride_xm + off_n_1[None, :] * stride_xn, mask=mask_1, other=0.0).to(tl.float32)
     x_2 = tl.load(X_fp8 + off_m[:, None] * stride_xm + off_n_2[None, :] * stride_xn, mask=mask_2, other=0.0).to(tl.float32)
 
-    x_s_1 = tl.load(X_S + pid_m * stride_xsm + pid_n * stride_xsn)
-    x_s_2 = tl.load(X_S + pid_m * stride_xsm + (pid_n + N // BLOCK_N // 2) * stride_xsn)
+    x_s_1 = tl.load(X_S + off_m[:, None] * stride_xsm + pid_n[None, :] * stride_xsn)
+    x_s_2 = tl.load(X_S + off_m[:, None] * stride_xsm + (pid_n + N // BLOCK_N // 2)[None, :] * stride_xsn)
 
     y_1 = x_1 * x_s_1
     y_2 = x_2 * x_s_2
@@ -143,9 +143,9 @@ def _bwd_pertoken_dequant(
 
 def bwd_pertoken_dequant(x: torch.Tensor, x_s: torch.Tensor, dtype) -> Tuple[torch.Tensor, torch.Tensor]:
     M, N = x.shape
-    BLOCK_M, BLOCK_N = 1, N // 2
+    BLOCK_M, BLOCK_N = 1, 128
     y = torch.empty(M, N, device=x.device, dtype=dtype)
-    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"] * 2))
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N // 2, meta["BLOCK_N"]))
     if x.is_contiguous():
         kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "num_warps": 8, "num_stages": 2}
     else:

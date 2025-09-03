@@ -170,7 +170,7 @@ class SwiGLUFunction(torch.autograd.Function):
             ctx.ori_input_dtype = input.dtype
             ctx.fp8_input_store = fp8_input_store
             return input_swiglu
-        # input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        input_for_backward = input
         if cpu_offload_input:
             input_for_backward.activation_offloading = True
         ctx.save_for_backward(input_for_backward)
