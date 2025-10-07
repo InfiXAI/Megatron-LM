@@ -56,3 +56,43 @@ def fused_topk(
     )
 
     return topk_weights, topk_ids, token_expert_indices
+
+
+class FuseTopkSoftmaxFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states: torch.Tensor,
+        gating_output: torch.Tensor,
+        topk: int,
+        renormalize: bool,
+        indices_type: Optional[torch.dtype] = None,
+    ):
+        topk_weights, topk_ids, token_expert_indices = fused_topk(hidden_states, gating_output, topk, renormalize, indices_type)
+
+        # 保存反向传播需要的中间结果
+        ctx.save_for_backward(topk_weights, topk_ids, token_expert_indices)
+        ctx.gating_output_shape = gating_output.shape
+        ctx.gating_output_dtype = gating_output.dtype
+        ctx.renormalize = renormalize
+
+        return topk_weights, topk_ids
+
+
+    @staticmethod
+    def backward(ctx, grad_topk_weights):
+        (topk_weights, topk_ids, token_expert_indices) = ctx.saved_tensors
+        gating_output_shape = ctx.gating_output_shape
+        gating_output_dtype = ctx.gating_output_dtype
+        renormalize = ctx.renormalize
+
+        dx = torch.zeros(gating_output_shape, dtype=gating_output_dtype, device=grad_topk_weights.device)
+        # softmax的backward
+        weighted_grad_sum = (topk_weights * grad_topk_weights).sum(dim=-1, keepdim=True)
+        grad_topk_values = topk_weights * (grad_topk_weights - weighted_grad_sum)
+
+        # topk的backward
+        dx.scatter_(-1, topk_ids, grad_topk_values)
+
+        return dx
