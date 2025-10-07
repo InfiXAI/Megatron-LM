@@ -2,10 +2,22 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cub/cub.cuh>
+#include <cub/util_type.cuh>
+#include <cuda/functional>
 #include "../cuda_utils.h"
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+// Define reduction operators based on CUDA version
+// CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum
+#if CUDA_VERSION >= 12090
+using MaxReduceOp = cuda::maximum<>;
+using MinReduceOp = cuda::minimum<>;
+#else
+using MaxReduceOp = cub::Max;
+using MinReduceOp = cub::Min;
+#endif
 
 namespace megatron{
 namespace moe{
@@ -25,124 +37,129 @@ class alignas(Alignment) AlignedArray {
 // ====================== Softmax things ===============================
 // We have our own implementation of softmax here so we can support transposing the output
 // in the softmax kernel when we extend this module to support expert-choice routing.
-template <typename T, int TPB>
+template <int TPB>
 __launch_bounds__(TPB) __global__
-    void moeSoftmax(const T* input, const bool* finished, float* output, const int num_cols) {
-  using BlockReduce = cub::BlockReduce<float, TPB>;
-  __shared__ typename BlockReduce::TempStorage tmpStorage;
+    void moeSoftmax(const float* input, const bool* finished, float* output, const int num_cols)
+{
+    using BlockReduce = cub::BlockReduce<float, TPB>;
+    __shared__ typename BlockReduce::TempStorage tmpStorage;
 
-  __shared__ float normalizing_factor;
-  __shared__ float float_max;
+    __shared__ float normalizing_factor;
+    __shared__ float float_max;
 
-  const int thread_row_offset = blockIdx.x * num_cols;
+    const int thread_row_offset = blockIdx.x * num_cols;
 
-  float threadData(-FLT_MAX);
+    float threadData(-FLT_MAX);
 
-  // Don't touch finished rows.
-  if ((finished != nullptr) && finished[blockIdx.x]) {
-    return;
-  }
+    // Don't touch finished rows.
+    if ((finished != nullptr) && finished[blockIdx.x])
+    {
+        return;
+    }
 
-  for (int ii = threadIdx.x; ii < num_cols; ii += TPB) {
-    const int idx = thread_row_offset + ii;
-    threadData = max(convert_to_float<T>(input[idx]), threadData);
-  }
+    for (int ii = threadIdx.x; ii < num_cols; ii += TPB)
+    {
+        const int idx = thread_row_offset + ii;
+        threadData = max(static_cast<float>(input[idx]), threadData);
+    }
 
-  const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, MaxReduceOp());
+    const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, MaxReduceOp());
+    if (threadIdx.x == 0)
+    {
+        float_max = maxElem;
+    }
+    __syncthreads();
 
-  if (threadIdx.x == 0) {
-    float_max = maxElem;
-  }
-  __syncthreads();
+    threadData = 0;
 
-  threadData = 0;
+    for (int ii = threadIdx.x; ii < num_cols; ii += TPB)
+    {
+        const int idx = thread_row_offset + ii;
+        threadData += exp((static_cast<float>(input[idx]) - float_max));
+    }
 
-  for (int ii = threadIdx.x; ii < num_cols; ii += TPB) {
-    const int idx = thread_row_offset + ii;
-    threadData += exp((convert_to_float<T>(input[idx]) - float_max));
-  }
+    const auto Z = BlockReduce(tmpStorage).Sum(threadData);
 
-  const auto Z = BlockReduce(tmpStorage).Sum(threadData);
+    if (threadIdx.x == 0)
+    {
+        normalizing_factor = 1.f / Z;
+    }
+    __syncthreads();
 
-  if (threadIdx.x == 0) {
-    normalizing_factor = 1.f / Z;
-  }
-  __syncthreads();
-
-  for (int ii = threadIdx.x; ii < num_cols; ii += TPB) {
-    const int idx = thread_row_offset + ii;
-    const float val = exp((convert_to_float<T>(input[idx]) - float_max)) * normalizing_factor;
-    output[idx] = val;
-  }
+    for (int ii = threadIdx.x; ii < num_cols; ii += TPB)
+    {
+        const int idx = thread_row_offset + ii;
+        const float val = exp((static_cast<float>(input[idx]) - float_max)) * normalizing_factor;
+        output[idx] = val;
+    }
 }
 
-template <int TPB>
+template <int TPB, typename IndType>
 __launch_bounds__(TPB) __global__ void moeTopK(
     const float* inputs_after_softmax,
     const bool* finished,
     float* output,
-    int* indices,
+    IndType* indices,
+    int* source_rows,
     const int num_experts,
     const int k,
     const int start_expert,
-    const int end_expert,
-    const bool renormalize) {
-  using cub_kvp = cub::KeyValuePair<int, float>;
-  using BlockReduce = cub::BlockReduce<cub_kvp, TPB>;
-  __shared__ typename BlockReduce::TempStorage tmpStorage;
+    const int end_expert)
+{
 
-  cub_kvp thread_kvp;
-  cub::ArgMax arg_max;
+    using cub_kvp = cub::KeyValuePair<int, float>;
+    using BlockReduce = cub::BlockReduce<cub_kvp, TPB>;
+    __shared__ typename BlockReduce::TempStorage tmpStorage;
 
-  const int block_row = blockIdx.x;
+    cub_kvp thread_kvp;
+    cub::ArgMax arg_max;
 
-  const bool row_is_active = finished ? !finished[block_row] : true;
-  const int thread_read_offset = blockIdx.x * num_experts;
-  float row_sum_for_renormalize = 0;
-  for (int k_idx = 0; k_idx < k; ++k_idx) {
-    thread_kvp.key = 0;
-    thread_kvp.value = -1.f;  // This is OK because inputs are probabilities
+    const int num_rows = gridDim.x;
+    const int block_row = blockIdx.x;
 
-    cub_kvp inp_kvp;
-    for (int expert = threadIdx.x; expert < num_experts; expert += TPB) {
-      const int idx = thread_read_offset + expert;
-      inp_kvp.key = expert;
-      inp_kvp.value = inputs_after_softmax[idx];
+    const bool row_is_active = finished ? !finished[block_row] : true;
+    const int thread_read_offset = blockIdx.x * num_experts;
+    for (int k_idx = 0; k_idx < k; ++k_idx)
+    {
+        thread_kvp.key = 0;
+        thread_kvp.value = -1.f; // This is OK because inputs are probabilities
 
-      for (int prior_k = 0; prior_k < k_idx; ++prior_k) {
-        const int prior_winning_expert = indices[k * block_row + prior_k];
+        cub_kvp inp_kvp;
+        for (int expert = threadIdx.x; expert < num_experts; expert += TPB)
+        {
+            const int idx = thread_read_offset + expert;
+            inp_kvp.key = expert;
+            inp_kvp.value = inputs_after_softmax[idx];
 
-        if (prior_winning_expert == expert) {
-          inp_kvp = thread_kvp;
+            for (int prior_k = 0; prior_k < k_idx; ++prior_k)
+            {
+                const int prior_winning_expert = indices[k * block_row + prior_k];
+
+                if (prior_winning_expert == expert)
+                {
+                    inp_kvp = thread_kvp;
+                }
+            }
+
+            thread_kvp = arg_max(inp_kvp, thread_kvp);
         }
-      }
 
-      thread_kvp = arg_max(inp_kvp, thread_kvp);
+        const cub_kvp result_kvp = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
+        if (threadIdx.x == 0)
+        {
+            // Ignore experts the node isn't responsible for with expert parallelism
+            const int expert = result_kvp.key;
+            const bool node_uses_expert = expert >= start_expert && expert < end_expert;
+            const bool should_process_row = row_is_active && node_uses_expert;
+
+            const int idx = k * block_row + k_idx;
+            output[idx] = result_kvp.value;
+            indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
+            assert(indices[idx] >= 0);
+            source_rows[idx] = k_idx * num_rows + block_row;
+        }
+        __syncthreads();
     }
-
-    const cub_kvp result_kvp = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
-    if (threadIdx.x == 0) {
-      // Ignore experts the node isn't responsible for with expert parallelism
-      const int expert = result_kvp.key;
-      const bool node_uses_expert = expert >= start_expert && expert < end_expert;
-      const bool should_process_row = row_is_active && node_uses_expert;
-
-      const int idx = k * block_row + k_idx;
-      output[idx] = result_kvp.value;
-      indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
-      assert(indices[idx] >= 0);
-      row_sum_for_renormalize += result_kvp.value;
-    }
-    __syncthreads();
-  }
-
-  if (renormalize && threadIdx.x == 0) {
-    float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
-    for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = k * block_row + k_idx;
-      output[idx] = output[idx] * row_sum_for_renormalize_inv;
-    }
-  }
 }
 
 // ====================== TopK softmax things ===============================

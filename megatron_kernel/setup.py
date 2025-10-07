@@ -7,8 +7,8 @@ ext_modules = []
 ext_modules.append(CUDAExtension(
     name="megatron_ops",
     sources=[
-        "megatron_kernel/csrc/moe/topk_softmax_kernels.cu",
-        "megatron_kernel/csrc/moe/torch_bindings.cpp",
+        "csrc/moe/topk_softmax_kernels.cu",
+        "csrc/moe/torch_bindings.cpp",
     ],
     include_dirs=[],
     libraries=["m"],  # 链接数学库（如 -lm）
@@ -41,12 +41,9 @@ if __name__ == '__main__':
         name='megatron_ops',
         version='1.0.0',
         install_requires=get_requirements(),
-        packages=['megatron_ops', 'megatron_ops/transformers/moe'],
-        package_data={
-            'megatron_ops': [
-                'csrc/*',
-                'csrc/moe/*'
-            ]
+        packages=['megatron_ops'],
+        package_dir={
+            'megatron_ops': 'python/megatron_ops',  # 告诉 setuptools 包的实际位置
         },
         ext_modules=ext_modules,
         cmdclass={
