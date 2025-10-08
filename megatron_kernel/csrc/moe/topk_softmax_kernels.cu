@@ -100,7 +100,6 @@ __launch_bounds__(TPB) __global__ void moeTopK(
     const bool* finished,
     float* output,
     IndType* indices,
-    int* source_rows,
     const int num_experts,
     const int k,
     const int start_expert,
@@ -156,7 +155,6 @@ __launch_bounds__(TPB) __global__ void moeTopK(
             output[idx] = result_kvp.value;
             indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
             assert(indices[idx] >= 0);
-            source_rows[idx] = k_idx * num_rows + block_row;
         }
         __syncthreads();
     }
@@ -181,7 +179,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
 template <int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG, int WARP_SIZE_PARAM, typename IndType>
 __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
     void topkGatingSoftmax(const float* input, const bool* finished, float* output, const int num_rows, IndType* indices,
-        int* source_rows, const int k, const int start_expert, const int end_expert)
+        float* softmax_output, const int k, const int start_expert, const int end_expert)
 {
     // We begin by enforcing compile time assertions and setting up compile time constants.
     static_assert(BYTES_PER_LDG == (BYTES_PER_LDG & -BYTES_PER_LDG), "BYTES_PER_LDG must be power of 2");
@@ -299,6 +297,16 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
         row_chunk[ii] = row_chunk[ii] * reciprocal_row_sum;
     }
 
+    // write softmax output for backward
+    const float* thread_softmax_row_ptr = softmax_output + thread_row * ELTS_PER_ROW;
+    const float* thread_write_softmax_ptr = thread_softmax_row_ptr + first_elt_read_by_thread;
+    AccessType* vec_thread_write_softmax_ptr = reinterpret_cast<AccessType*>(thread_write_softmax_ptr);
+
+    for (int ii = 0; ii < LDG_PER_THREAD; ++ii)
+    {
+        vec_thread_write_softmax_ptr[ii * THREADS_PER_ROW] = row_chunk_vec_ptr[ii];
+    }
+
     // Now, softmax_res contains the softmax of the row chunk. Now, I want to find the topk elements in each row, along
     // with the max index.
     int start_col = first_elt_read_by_thread;
@@ -356,7 +364,6 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
             const int idx = k * thread_row + k_idx;
             output[idx] = max_val;
             indices[idx] = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
-            source_rows[idx] = k_idx * num_rows + thread_row;
         }
 
         // Finally, we clear the value in the thread with the current max if there is another iteration to run.
@@ -393,7 +400,7 @@ struct TopkConstants
 
 template <int EXPERTS, int WARPS_PER_TB, int WARP_SIZE_PARAM, int MAX_BYTES_PER_LDG, typename IndType>
 void topkGatingSoftmaxLauncherHelper(const float* input, const bool* finished, float* output, IndType* indices,
-    int* source_row, const int num_rows, const int k, const int start_expert, const int end_expert, cudaStream_t stream)
+    float* softmax_output, const int num_rows, const int k, const int start_expert, const int end_expert, cudaStream_t stream)
 {
     static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(float) * EXPERTS);
     using Constants = detail::TopkConstants<EXPERTS, BYTES_PER_LDG, WARP_SIZE_PARAM>;
@@ -404,7 +411,7 @@ void topkGatingSoftmaxLauncherHelper(const float* input, const bool* finished, f
 
     dim3 block_dim(WARP_SIZE_PARAM, WARPS_PER_TB);
     topkGatingSoftmax<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, WARP_SIZE_PARAM><<<num_blocks, block_dim, 0, stream>>>(
-        input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert);
+        input, finished, output, num_rows, indices, softmax_output, k, start_expert, end_expert);
 }
 
 #ifndef USE_ROCM
@@ -413,17 +420,17 @@ void topkGatingSoftmaxLauncherHelper(const float* input, const bool* finished, f
                   "Unsupported warp size. Only 32 is supported for CUDA");            \
     topkGatingSoftmaxLauncherHelper<NUM_EXPERTS, WARPS_PER_TB, WARP_SIZE, MAX_BYTES>( \
         gating_output, nullptr, topk_weights, topk_indices,                           \
-        token_expert_indices, num_tokens, topk, 0, num_experts, stream);
+        softmax_workspace, num_tokens, topk, 0, num_experts, stream);
 #else
 #define LAUNCH_SOFTMAX(NUM_EXPERTS, WARPS_PER_TB, MAX_BYTES)                             \
     if (WARP_SIZE == 64) {                                                               \
         topkGatingSoftmaxLauncherHelper<NUM_EXPERTS, WARPS_PER_TB, 64, MAX_BYTES>(       \
             gating_output, nullptr, topk_weights, topk_indices,                          \
-            token_expert_indices, num_tokens, topk, 0, num_experts, stream);             \
+            softmax_workspace, num_tokens, topk, 0, num_experts, stream);             \
     } else if (WARP_SIZE == 32) {                                                        \
         topkGatingSoftmaxLauncherHelper<NUM_EXPERTS, WARPS_PER_TB, 32, MAX_BYTES>(       \
             gating_output, nullptr, topk_weights, topk_indices,                          \
-            token_expert_indices, num_tokens, topk, 0, num_experts, stream);             \
+            softmax_workspace, num_tokens, topk, 0, num_experts, stream);             \
     } else {                                                                             \
         assert(false && "Unsupported warp size. Only 32 and 64 are supported for ROCm"); \
     }
@@ -434,7 +441,6 @@ void topkGatingSoftmaxKernelLauncher(
     const float* gating_output,
     float* topk_weights,
     IndType* topk_indices,
-    int* token_expert_indices,
     float* softmax_workspace,
     const int num_tokens,
     const int num_experts,
@@ -503,7 +509,7 @@ void topkGatingSoftmaxKernelLauncher(
             moeSoftmax<TPB><<<num_tokens, TPB, 0, stream>>>(
                 gating_output, nullptr, softmax_workspace, num_experts);
             moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
-                softmax_workspace, nullptr, topk_weights, topk_indices, token_expert_indices,
+                softmax_workspace, nullptr, topk_weights, topk_indices,
                 num_experts, topk, 0, num_experts);
         }
     }
@@ -515,11 +521,11 @@ void topkGatingSoftmaxKernelLauncher(
 void topk_softmax(
     torch::Tensor& topk_weights,                // [num_tokens, topk]
     torch::Tensor& topk_indices,                // [num_tokens, topk]
-    torch::Tensor& token_expert_indices,        // [num_tokens, topk]
-    torch::Tensor& gating_output)               // [num_tokens, num_experts]
+    torch::Tensor& gating_output,               // [num_tokens, num_experts]
+    torch::Tensor& softmax_output)
 {
-    const int num_experts = gating_output.size(-1);
-    const auto num_tokens = gating_output.numel() / num_experts;
+    const int num_experts = gating_output.size(-1);     // 专家总数
+    const auto num_tokens = gating_output.numel() / num_experts;    // token数量
     const int topk = topk_weights.size(-1);
 
     const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
@@ -528,7 +534,6 @@ void topk_softmax(
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    torch::Tensor softmax_workspace = torch::empty({workspace_size}, gating_output.options());
 
     if(topk_indices.scalar_type() == at::ScalarType::Int)
     {
@@ -536,8 +541,7 @@ void topk_softmax(
             gating_output.data_ptr<float>(),
             topk_weights.data_ptr<float>(),
             topk_indices.data_ptr<int>(),
-            token_expert_indices.data_ptr<int>(),
-            softmax_workspace.data_ptr<float>(),
+            softmax_output.data_ptr<float>(),
             num_tokens,
             num_experts,
             topk,
@@ -549,8 +553,7 @@ void topk_softmax(
             gating_output.data_ptr<float>(),
             topk_weights.data_ptr<float>(),
             topk_indices.data_ptr<uint32_t>(),
-            token_expert_indices.data_ptr<int>(),
-            softmax_workspace.data_ptr<float>(),
+            softmax_output.data_ptr<float>(),
             num_tokens,
             num_experts,
             topk,
@@ -562,8 +565,7 @@ void topk_softmax(
             gating_output.data_ptr<float>(),
             topk_weights.data_ptr<float>(),
             topk_indices.data_ptr<int64_t>(),
-            token_expert_indices.data_ptr<int>(),
-            softmax_workspace.data_ptr<float>(),
+            softmax_output.data_ptr<float>(),
             num_tokens,
             num_experts,
             topk,

@@ -41,9 +41,9 @@ if __name__ == '__main__':
         name='megatron_ops',
         version='1.0.0',
         install_requires=get_requirements(),
-        packages=['megatron_ops'],
+        packages=['megatron_ops/transformers/moe'],
         package_dir={
-            'megatron_ops': 'python/megatron_ops',  # 告诉 setuptools 包的实际位置
+            'megatron_ops/transformers/moe': 'python/megatron_ops/transformers/moe',  # 告诉 setuptools 包的实际位置
         },
         ext_modules=ext_modules,
         cmdclass={
