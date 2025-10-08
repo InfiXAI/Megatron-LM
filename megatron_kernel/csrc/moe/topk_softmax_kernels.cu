@@ -298,8 +298,8 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
     }
 
     // write softmax output for backward
-    const float* thread_softmax_row_ptr = softmax_output + thread_row * ELTS_PER_ROW;
-    const float* thread_write_softmax_ptr = thread_softmax_row_ptr + first_elt_read_by_thread;
+    float* thread_softmax_row_ptr = softmax_output + thread_row * ELTS_PER_ROW;
+    float* thread_write_softmax_ptr = thread_softmax_row_ptr + first_elt_read_by_thread;
     AccessType* vec_thread_write_softmax_ptr = reinterpret_cast<AccessType*>(thread_write_softmax_ptr);
 
     for (int ii = 0; ii < LDG_PER_THREAD; ++ii)
